@@ -3,7 +3,7 @@
  *
  * GK20A Graphics channel
  *
- * Copyright (c) 2011-2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2011-2016, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -521,10 +521,17 @@ static int gk20a_channel_cycle_stats(struct channel_gk20a *ch,
 #endif
 
 static int gk20a_init_error_notifier(struct channel_gk20a *ch,
-		struct nvhost_set_error_notifier *args) {
-	void *va;
-
+		struct nvhost_set_error_notifier *args)
+{
 	struct dma_buf *dmabuf;
+	void *va;
+	u64 end;
+
+	if (unlikely(args->offset >
+		     U64_MAX - sizeof(struct nvhost_notification)))
+		return -EINVAL;
+
+	end = args->offset + sizeof(struct nvhost_notification);
 
 	if (!args->mem) {
 		pr_err("gk20a_init_error_notifier: invalid memory handle\n");
@@ -533,13 +540,19 @@ static int gk20a_init_error_notifier(struct channel_gk20a *ch,
 
 	dmabuf = dma_buf_get(args->mem);
 
-	if (ch->error_notifier_ref)
-		gk20a_free_error_notifiers(ch);
+	gk20a_free_error_notifiers(ch);
 
 	if (IS_ERR(dmabuf)) {
 		pr_err("Invalid handle: %d\n", args->mem);
 		return -EINVAL;
 	}
+
+	if (end > dmabuf->size || end < sizeof(struct nvhost_notification)) {
+		dma_buf_put(dmabuf);
+		pr_err("gk20a_init_error_notifier: invalid offset\n");
+		return -EINVAL;
+	}
+
 	/* map handle */
 	va = dma_buf_vmap(dmabuf);
 	if (!va) {
@@ -548,16 +561,23 @@ static int gk20a_init_error_notifier(struct channel_gk20a *ch,
 		return -ENOMEM;
 	}
 
-	/* set channel notifiers pointer */
-	ch->error_notifier_ref = dmabuf;
 	ch->error_notifier = va + args->offset;
 	ch->error_notifier_va = va;
 	memset(ch->error_notifier, 0, sizeof(struct nvhost_notification));
+
+	/* set channel notifiers pointer */
+	mutex_lock(&ch->error_notifier_mutex);
+	ch->error_notifier_ref = dmabuf;
+	mutex_unlock(&ch->error_notifier_mutex);
+
 	return 0;
 }
 
 void gk20a_set_error_notifier(struct channel_gk20a *ch, __u32 error)
 {
+	bool notifier_set = false;
+
+	mutex_lock(&ch->error_notifier_mutex);
 	if (ch->error_notifier_ref) {
 		struct timespec time_data;
 		u64 nsec;
@@ -570,20 +590,27 @@ void gk20a_set_error_notifier(struct channel_gk20a *ch, __u32 error)
 				(u32)(nsec >> 32);
 		ch->error_notifier->info32 = error;
 		ch->error_notifier->status = 0xffff;
-		gk20a_err(dev_from_gk20a(ch->g),
-				"error notifier set to %d\n", error);
+
+		notifier_set = true;
 	}
+	mutex_unlock(&ch->error_notifier_mutex);
+
+	if (notifier_set)
+		gk20a_err(dev_from_gk20a(ch->g),
+		    "error notifier set to %d for ch %d", error, ch->hw_chid);
 }
 
 static void gk20a_free_error_notifiers(struct channel_gk20a *ch)
 {
+	mutex_lock(&ch->error_notifier_mutex);
 	if (ch->error_notifier_ref) {
 		dma_buf_vunmap(ch->error_notifier_ref, ch->error_notifier_va);
 		dma_buf_put(ch->error_notifier_ref);
-		ch->error_notifier_ref = 0;
-		ch->error_notifier = 0;
-		ch->error_notifier_va = 0;
+		ch->error_notifier_ref = NULL;
+		ch->error_notifier = NULL;
+		ch->error_notifier_va = NULL;
 	}
+	mutex_unlock(&ch->error_notifier_mutex);
 }
 
 void gk20a_free_channel(struct channel_gk20a *ch, bool finish)
@@ -630,7 +657,7 @@ void gk20a_free_channel(struct channel_gk20a *ch, bool finish)
 	memset(&ch->ramfc, 0, sizeof(struct mem_desc_sub));
 
 	/* free gpfifo */
-	if (ch->gpfifo.gpu_va)
+	if (ch->vm && ch->gpfifo.gpu_va)
 		gk20a_gmmu_unmap(ch_vm, ch->gpfifo.gpu_va,
 			ch->gpfifo.size, gk20a_mem_flag_none);
 	if (ch->gpfifo.cpu_va)
@@ -659,8 +686,9 @@ unbind:
 	channel_gk20a_unbind(ch);
 	channel_gk20a_free_inst(g, ch);
 
-	ch->vpr = false;
+	gk20a_vm_put(ch->vm); /* Don't use VM after this. */
 	ch->vm = NULL;
+	ch->vpr = false;
 	WARN_ON(ch->sync);
 
 	/* unlink all debug sessions */
@@ -1454,6 +1482,15 @@ static int gk20a_submit_channel_gpfifo(struct channel_gk20a *c,
 	gk20a_dbg_info("pre-submit put %d, get %d, size %d",
 		c->gpfifo.put, c->gpfifo.get, c->gpfifo.entry_num);
 
+	/* an address space needs to have been bound at this point.   */
+	if (!gk20a_channel_as_bound(c)) {
+		gk20a_err(d,
+				"not bound to an address space at time of gpfifo"
+				" submit.  Attempting to create and bind to"
+				" one...");
+		return -EINVAL;
+	}
+
 	/* Invalidate tlb if it's dirty...                                   */
 	/* TBD: this should be done in the cmd stream, not with PRIs.        */
 	/* We don't know what context is currently running...                */
@@ -1598,6 +1635,7 @@ int gk20a_init_channel_support(struct gk20a *g, u32 chid)
 	c->hw_chid = chid;
 	c->bound = false;
 	c->remove_support = gk20a_remove_channel_support;
+	mutex_init(&c->error_notifier_mutex);
 	mutex_init(&c->jobs_lock);
 	INIT_LIST_HEAD(&c->jobs);
 #if defined(CONFIG_GK20A_CYCLE_STATS)
@@ -1701,6 +1739,7 @@ static int gk20a_channel_wait(struct channel_gk20a *ch,
 	u32 offset;
 	unsigned long timeout;
 	int remain, ret = 0;
+	u64 end;
 
 	gk20a_dbg_fn("");
 
@@ -1717,10 +1756,21 @@ static int gk20a_channel_wait(struct channel_gk20a *ch,
 		id = args->condition.notifier.nvmap_handle;
 		offset = args->condition.notifier.offset;
 
+		if (unlikely(offset > U32_MAX - sizeof(struct notification)))
+			return -EINVAL;
+
+		end = offset + sizeof(struct notification);
+
 		dmabuf = dma_buf_get(id);
 		if (IS_ERR(dmabuf)) {
 			gk20a_err(d, "invalid notifier nvmap handle 0x%lx",
 				   id);
+			return -EINVAL;
+		}
+
+		if (end > dmabuf->size || end < sizeof(struct notification)) {
+			dma_buf_put(dmabuf);
+			gk20a_err(d, "invalid notifier offset\n");
 			return -EINVAL;
 		}
 
@@ -1941,7 +1991,7 @@ long gk20a_channel_ioctl(struct file *filp,
 {
 	struct channel_gk20a *ch = filp->private_data;
 	struct platform_device *dev = ch->g->dev;
-	u8 buf[NVHOST_IOCTL_CHANNEL_MAX_ARG_SIZE];
+	u8 buf[NVHOST_IOCTL_CHANNEL_MAX_ARG_SIZE] = {0};
 	int err = 0;
 
 	if ((_IOC_TYPE(cmd) != NVHOST_IOCTL_MAGIC) ||

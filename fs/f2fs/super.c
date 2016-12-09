@@ -712,7 +712,6 @@ static int f2fs_remount(struct super_block *sb, int *flags, char *data)
 	org_mount_opt = sbi->mount_opt;
 	active_logs = sbi->active_logs;
 
-	sbi->mount_opt.opt = 0;
 	sbi->active_logs = NR_CURSEG_TYPE;
 
 	/* parse mount options */
@@ -836,7 +835,7 @@ static const struct export_operations f2fs_export_ops = {
 	.get_parent = f2fs_get_parent,
 };
 
-static loff_t max_file_size(unsigned bits)
+loff_t max_file_size(unsigned bits)
 {
 	loff_t result = (DEF_ADDRS_PER_INODE - F2FS_INLINE_XATTR_ADDRS);
 	loff_t leaf_count = ADDRS_PER_BLOCK;

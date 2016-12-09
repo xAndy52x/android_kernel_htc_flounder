@@ -1,7 +1,7 @@
 /*
  * Tegra Graphics Host Client Module
  *
- * Copyright (c) 2010-2014, NVIDIA Corporation. All rights reserved.
+ * Copyright (c) 2010-2016, NVIDIA Corporation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -62,6 +62,10 @@ static int validate_reg(struct platform_device *ndev, u32 offset, int count)
 	struct resource *r;
 	struct nvhost_device_data *pdata = platform_get_drvdata(ndev);
 
+	/* check if offset is u32 aligned */
+	if (offset & 3)
+		return -EINVAL;
+
 	r = platform_get_resource(pdata->master ? pdata->master : ndev,
 			IORESOURCE_MEM, 0);
 	if (!r) {
@@ -74,6 +78,26 @@ static int validate_reg(struct platform_device *ndev, u32 offset, int count)
 		err = -EPERM;
 
 	return err;
+}
+
+int validate_max_size(struct platform_device *ndev, u32 size)
+{
+	struct resource *r;
+
+	/* check if size is non-zero and u32 aligned */
+	if (!size || size & 3)
+		return -EINVAL;
+
+	r = platform_get_resource(ndev, IORESOURCE_MEM, 0);
+	if (!r) {
+		dev_err(&ndev->dev, "failed to get memory resource\n");
+		return -ENODEV;
+	}
+
+	if (size > resource_size(r))
+		return -EPERM;
+
+	return 0;
 }
 
 static __iomem void *get_aperture(struct platform_device *pdev)
@@ -244,10 +268,9 @@ static int __nvhost_channelopen(struct inode *inode,
 	trace_nvhost_channel_open(dev_name(&ch->dev->dev));
 
 	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
-	if (!priv) {
-		nvhost_putchannel(ch, 1);
+	if (!priv)
 		goto fail;
-	}
+
 	filp->private_data = priv;
 	priv->ch = ch;
 	if (nvhost_module_add_client(ch->dev, priv))
@@ -277,13 +300,15 @@ static int __nvhost_channelopen(struct inode *inode,
 		priv->timeout = 0;
 	mutex_unlock(&channel_lock);
 	return 0;
+
 fail_priv:
 	nvhost_module_remove_client(ch->dev, priv);
 fail_add_client:
 	kfree(priv);
 fail:
+	nvhost_putchannel(ch, 1);
 	mutex_unlock(&channel_lock);
-	nvhost_channelrelease(inode, filp);
+
 	return -ENOMEM;
 }
 
@@ -324,8 +349,15 @@ void nvhost_free_error_notifiers(struct nvhost_channel *ch)
 static int nvhost_init_error_notifier(struct nvhost_channel *ch,
 		struct nvhost_set_error_notifier *args) {
 	void *va;
-
+	u64 end;
 	struct dma_buf *dmabuf;
+
+	if (unlikely(args->offset >
+		     U64_MAX - sizeof(struct nvhost_notification)))
+		return -EINVAL;
+
+	end = args->offset + sizeof(struct nvhost_notification);
+
 	if (!args->mem) {
 		dev_err(&ch->dev->dev, "invalid memory handle\n");
 		return -EINVAL;
@@ -341,7 +373,13 @@ static int nvhost_init_error_notifier(struct nvhost_channel *ch,
 		return -EINVAL;
 	}
 
-	/* map handle */
+	if (end > dmabuf->size || end < sizeof(struct nvhost_notification)) {
+		dma_buf_put(dmabuf);
+		pr_err("%s: invalid offset\n", __func__);
+		return -EINVAL;
+	}
+
+	/* map handle and clear error notifier struct */
 	va = dma_buf_vmap(dmabuf);
 	if (!va) {
 		dma_buf_put(dmabuf);
@@ -386,7 +424,8 @@ static int nvhost_ioctl_channel_submit(struct nvhost_channel_userctx *ctx,
 	u32 *local_waitbases = NULL, *local_class_ids = NULL;
 	int err, i, hwctx_syncpt_idx = -1;
 
-	if (num_syncpt_incrs > host->info.nb_pts)
+	if (num_cmdbufs < 0 || num_syncpt_incrs <= 0
+		|| num_syncpt_incrs > host->info.nb_pts)
 		return -EINVAL;
 
 	job = nvhost_job_alloc(ctx->ch,
@@ -567,7 +606,15 @@ static int nvhost_ioctl_channel_submit(struct nvhost_channel_userctx *ctx,
 	 * syncpoint is used. */
 
 	if (args->flags & BIT(NVHOST_SUBMIT_FLAG_SYNC_FENCE_FD)) {
-		struct nvhost_ctrl_sync_fence_info pts[num_syncpt_incrs];
+		struct nvhost_ctrl_sync_fence_info *pts;
+
+		pts = kzalloc(num_syncpt_incrs *
+			      sizeof(struct nvhost_ctrl_sync_fence_info),
+			      GFP_KERNEL);
+		if (!pts) {
+			err = -ENOMEM;
+			goto fail;
+		}
 
 		for (i = 0; i < num_syncpt_incrs; i++) {
 			pts[i].id = job->sp[i].id;
@@ -576,6 +623,7 @@ static int nvhost_ioctl_channel_submit(struct nvhost_channel_userctx *ctx,
 
 		err = nvhost_sync_create_fence_fd(ctx->ch->dev,
 				pts, num_syncpt_incrs, "fence", &args->fence);
+		kfree(pts);
 		if (err)
 			goto fail;
 	} else if (num_syncpt_incrs == 1)

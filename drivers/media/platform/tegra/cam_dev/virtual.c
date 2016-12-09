@@ -1,7 +1,7 @@
 /*
  * virtual.c - Virtual kernel driver
  *
- * Copyright (c) 2013-2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2013-2016, NVIDIA CORPORATION.  All rights reserved.
 
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -41,10 +41,10 @@ struct chip_config {
 };
 
 static int virtual_update(
-	struct camera_device *cdev, struct cam_update *upd, int num)
+	struct camera_device *cdev, struct cam_update *upd, u32 num)
 {
 	int err = 0;
-	int idx;
+	u32 idx;
 
 	dev_dbg(cdev->dev, "%s %d\n", __func__, num);
 	mutex_lock(&cdev->mutex);
@@ -107,32 +107,6 @@ static int virtual_update(
 			else
 				pinmux = &cdev->mclk_disable_idx;
 			*pinmux = upd[idx].arg;
-			break;
-		}
-		case UPDATE_GPIO:
-		{
-			struct nvc_gpio *gpio;
-
-			if (upd[idx].index >= cdev->num_gpio) {
-				dev_err(cdev->dev,
-					"gpio index %d out of range.\n",
-					upd[idx].index);
-				err = -ENODEV;
-				break;
-			}
-			gpio = (void *)((unsigned long)upd[idx].arg);
-			if (gpio->gpio >= ARCH_NR_GPIOS) {
-				dev_err(cdev->dev,
-					"gpio index %d out of range.\n",
-					gpio->gpio);
-				err = -ENODEV;
-				break;
-			}
-
-			dev_dbg(cdev->dev, "UPDATE_GPIO: %d %u\n",
-				upd[idx].index, upd[idx].arg);
-			gpio->valid = true;
-			cdev->gpios[upd[idx].index] = *gpio;
 			break;
 		}
 		default:
@@ -289,7 +263,7 @@ static int virtual_device_sanity_check(
 
 	if (dev_info->bus_type != CAMERA_DEVICE_TYPE_I2C) {
 		dev_err(dev, "%s unsupported device type %d!\n",
-		__func__, dev_info->bus_type);
+			__func__, dev_info->bus_type);
 		return -ENODEV;
 	}
 
@@ -297,14 +271,14 @@ static int virtual_device_sanity_check(
 		dev_info->regmap_cfg.addr_bits != 8 &&
 		dev_info->regmap_cfg.addr_bits != 16) {
 		dev_err(dev, "%s unsupported address bits %d!\n",
-		__func__, dev_info->regmap_cfg.addr_bits);
+			__func__, dev_info->regmap_cfg.addr_bits);
 		return -ENODEV;
 	}
 
 	if (dev_info->regmap_cfg.val_bits != 8 &&
 		dev_info->regmap_cfg.val_bits != 16) {
 		dev_err(dev, "%s unsupported data bits %d!\n",
-		__func__, dev_info->regmap_cfg.val_bits);
+			__func__, dev_info->regmap_cfg.val_bits);
 		return -ENODEV;
 	}
 
@@ -312,13 +286,13 @@ static int virtual_device_sanity_check(
 		dev_info->regmap_cfg.cache_type != REGCACHE_RBTREE &&
 		dev_info->regmap_cfg.cache_type != REGCACHE_COMPRESSED) {
 		dev_err(dev, "%s unsupported cache type %d!\n",
-		__func__, dev_info->regmap_cfg.cache_type);
+			__func__, dev_info->regmap_cfg.cache_type);
 		return -ENODEV;
 	}
 
 	if (dev_info->gpio_num >= ARCH_NR_GPIOS) {
 		dev_err(dev, "%s too many gpios %d!\n",
-		__func__, dev_info->gpio_num);
+			__func__, dev_info->gpio_num);
 		return -ENODEV;
 	}
 
@@ -332,9 +306,16 @@ static int virtual_device_sanity_check(
 			__func__, dev_info->clk_num);
 	}
 
+	if (dev_info->reg_num >= VIRTUAL_DEV_MAX_REGULATORS) {
+		dev_err(dev, "%s too many regulators %u!\n",
+			__func__, dev_info->reg_num);
+		return -ENODEV;
+	}
+
 	*len = 0;
 	num = dev_info->reg_num;
 	nptr = &dev_info->reg_names[0];
+
 	while (num) {
 		n = strlen(nptr);
 		if (!n) {
@@ -347,6 +328,18 @@ static int virtual_device_sanity_check(
 		num--;
 	}
 	dev_dbg(dev, "regulator name size: %d\n", *len);
+
+	if (dev_info->pwr_on_size > VIRTUAL_DEV_MAX_POWER_SIZE) {
+		dev_err(dev, "%s power on function size too big %d!\n",
+			__func__, dev_info->pwr_on_size);
+		return -ENODEV;
+	}
+
+	if (dev_info->pwr_off_size > VIRTUAL_DEV_MAX_POWER_SIZE) {
+		dev_err(dev, "%s power off function size too big %d!\n",
+			__func__, dev_info->pwr_off_size);
+		return -ENODEV;
+	}
 
 	return 0;
 }

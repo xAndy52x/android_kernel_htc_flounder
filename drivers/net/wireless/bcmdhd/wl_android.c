@@ -67,7 +67,7 @@
 #define CMD_RXFILTER_REMOVE	"RXFILTER-REMOVE"
 #define CMD_BTCOEXSCAN_START	"BTCOEXSCAN-START"
 #define CMD_BTCOEXSCAN_STOP	"BTCOEXSCAN-STOP"
-#define CMD_BTCOEXMODE		"BTCOEXMODE"
+#define CMD_BTCOEXMODE		"BTCOEXMODE " /* "BTCOEXMODE %d" */
 #define CMD_SETSUSPENDOPT	"SETSUSPENDOPT"
 #define CMD_SETSUSPENDMODE      "SETSUSPENDMODE"
 #define CMD_P2P_DEV_ADDR	"P2P_DEV_ADDR"
@@ -176,7 +176,7 @@ int dhd_net_bus_devreset(struct net_device *dev, uint8 flag);
 int dhd_dev_init_ioctl(struct net_device *dev);
 #ifdef WL_CFG80211
 int wl_cfg80211_get_p2p_dev_addr(struct net_device *net, struct ether_addr *p2pdev_addr);
-int wl_cfg80211_set_btcoex_dhcp(struct net_device *dev, dhd_pub_t *dhd, char *command);
+int wl_cfg80211_set_btcoex_dhcp(struct net_device *dev, int mode);
 #else
 int wl_cfg80211_get_p2p_dev_addr(struct net_device *net, struct ether_addr *p2pdev_addr)
 { return 0; }
@@ -365,8 +365,9 @@ wls_parse_batching_cmd(struct net_device *dev, char *command, int total_len)
 					" <> params\n", __FUNCTION__));
 					goto exit;
 				}
-					while ((token2 = strsep(&pos2,
-					PNO_PARAM_CHANNEL_DELIMETER)) != NULL) {
+
+				while ((token2 = strsep(&pos2, PNO_PARAM_CHANNEL_DELIMETER))
+						!= NULL) {
 					if (token2 == NULL || !*token2)
 						break;
 					if (*token2 == '\0')
@@ -377,13 +378,20 @@ wls_parse_batching_cmd(struct net_device *dev, char *command, int total_len)
 						DHD_PNO(("band : %s\n",
 							(*token2 == 'A')? "A" : "B"));
 					} else {
+						if ((batch_params.nchan >= WL_NUMCHANNELS) ||
+						    (i >= WL_NUMCHANNELS)) {
+							DHD_ERROR(("Too many nchan %d\n",
+								batch_params.nchan));
+							err = BCME_BUFTOOSHORT;
+							goto exit;
+						}
 						batch_params.chan_list[i++] =
-						simple_strtol(token2, NULL, 0);
+							simple_strtol(token2, NULL, 0);
 						batch_params.nchan++;
-						DHD_PNO(("channel :%d\n",
-						batch_params.chan_list[i-1]));
+						DHD_PNO(("channel: %d\n",
+							batch_params.chan_list[i-1]));
 					}
-				 }
+				}
 			} else if (!strncmp(param, PNO_PARAM_RTT, strlen(PNO_PARAM_RTT))) {
 				batch_params.rtt = simple_strtol(value, NULL, 0);
 				DHD_PNO(("rtt : %d\n", batch_params.rtt));
@@ -699,7 +707,8 @@ int wl_android_wifi_on(struct net_device *dev)
 #if defined(BCMSDIO) || defined(BCMPCIE)
 		ret = dhd_net_bus_devreset(dev, FALSE);
 #ifdef BCMSDIO
-		dhd_net_bus_resume(dev, 1);
+		if (!ret)
+			dhd_net_bus_resume(dev, 1);
 #endif
 #endif /* BCMSDIO || BCMPCIE */
 #ifndef BCMPCIE
@@ -902,7 +911,7 @@ int wl_android_set_ibss_beacon_ouidata(struct net_device *dev, char *command, in
 	}
 	else {
 		/* do NOT free 'vndr_ie' for the next process */
-		wl_cfg80211_ibss_vsie_set_buffer(vndr_ie, tot_len);
+		wl_cfg80211_ibss_vsie_set_buffer(dev, vndr_ie, tot_len);
 	}
 
 	if (ioctl_buf) {
@@ -1287,6 +1296,11 @@ int wl_android_priv_cmd(struct net_device *net, struct ifreq *ifr, int cmd)
 		goto exit;
 	}
 
+	if (!capable(CAP_NET_ADMIN)) {
+		ret = -EPERM;
+		goto exit;
+	}
+
 #ifdef CONFIG_COMPAT
 	if (is_compat_task()) {
 		compat_android_wifi_priv_cmd compat_priv_cmd;
@@ -1379,20 +1393,21 @@ int wl_android_priv_cmd(struct net_device *net, struct ifreq *ifr, int cmd)
 	else if (strnicmp(command, CMD_BTCOEXSCAN_STOP, strlen(CMD_BTCOEXSCAN_STOP)) == 0) {
 		/* TBD: BTCOEXSCAN-STOP */
 	}
-	else if (strnicmp(command, CMD_BTCOEXMODE, strlen(CMD_BTCOEXMODE)) == 0) {
+	else if (priv_cmd.total_len > strlen(CMD_BTCOEXMODE) &&
+		 strnicmp(command, CMD_BTCOEXMODE, strlen(CMD_BTCOEXMODE)) == 0) {
+		int mode = command[strlen(CMD_BTCOEXMODE)] - '0';
 #ifdef WL_CFG80211
-		void *dhdp = wl_cfg80211_get_dhdp();
-		bytes_written = wl_cfg80211_set_btcoex_dhcp(net, dhdp, command);
+		wl_cfg80211_set_btcoex_dhcp(net, mode);
 #else
 #ifdef PKT_FILTER_SUPPORT
-		uint mode = *(command + strlen(CMD_BTCOEXMODE) + 1) - '0';
-
 		if (mode == 1)
 			net_os_enable_packet_filter(net, 0); /* DHCP starts */
 		else
 			net_os_enable_packet_filter(net, 1); /* DHCP ends */
 #endif /* PKT_FILTER_SUPPORT */
 #endif /* WL_CFG80211 */
+		/* We are always successful */
+		bytes_written = sprintf(command, "OK");
 	}
 	else if (strnicmp(command, CMD_SETSUSPENDOPT, strlen(CMD_SETSUSPENDOPT)) == 0) {
 		bytes_written = wl_android_set_suspendopt(net, command, priv_cmd.total_len);
