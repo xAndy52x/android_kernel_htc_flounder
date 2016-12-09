@@ -1875,8 +1875,6 @@ follow_page_again:
 				int ret;
 				unsigned int fault_flags = 0;
 
-				mutex_unlock(&s_follow_page_lock);
-
 				fault_flags = FAULT_FLAG_NO_CMA;
 
 				/* For mlock, just skip the stack guard page. */
@@ -1942,7 +1940,6 @@ follow_page_again:
 					foll_flags |= FOLL_COW;
 
 				cond_resched();
-				mutex_lock(&s_follow_page_lock);
 			}
 			if (IS_ERR(page))
 				return i ? i : PTR_ERR(page);
@@ -1969,7 +1966,6 @@ follow_page_again:
 				if (page == old_page)
 					wait_on_page_locked_timeout(page);
 
-				mutex_unlock(&s_follow_page_lock);
 				if (foll_flags & FOLL_WRITE) {
 					/* page would be marked as old during
 					 * migration. To make it young, call
